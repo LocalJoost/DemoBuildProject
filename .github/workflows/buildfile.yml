@@ -1,0 +1,148 @@
+name: DemoBuild
+
+on: 
+  workflow_dispatch:
+  push:
+      branches:
+        - main
+
+env:
+  UNITY_STARTUPTIME: 120
+  UNITY_MAX_STEPTIMEOUT: 110
+  UNITY_PROJECT_VERSION: 2021.3.16f1
+  UNITY_LOGFILE: demobuild.txt
+  PACKAGE_NAME: DemoBuildProject
+  UNITY_ROOT_FOLDER: .
+  UPLOAD_CONTAINER_NAME: builds
+  BUILD_VERSION: 1.0.0.0
+  BUILD_NAME: Master
+
+jobs:
+
+  build-project:
+    runs-on: UnityBuildDemo
+    env:
+      ACTIONS_ALLOW_UNSECURE_COMMANDS: 'true'
+
+    name: Build job
+    steps: 
+
+      - name: Checkout repo
+        uses: actions/checkout@v3
+        # with:  
+        #   submodules: recursive
+        #   token: ${{ secrets.SUBMODULE_ACCESS_TOKEN }}
+    
+      - name: Build C++ solution with Unity
+        run : |
+          $startupTime=[double]$Env:UNITY_STARTUPTIME;
+          $timeout=[double]$Env:UNITY_MAX_STEPTIMEOUT
+          $editor="C:/Program Files/Unity/Hub/Editor/"+ $Env:UNITY_PROJECT_VERSION + "/Editor/Unity.exe";
+          $unityBuildLogFile="c:/logs/" + $Env:UNITY_LOGFILE;
+          if (Test-Path $unityBuildLogFile)
+          {
+            Remove-Item $unityBuildLogFile;
+          }
+          New-Item -Path $unityBuildLogFile -ItemType File
+          $argumentList="-projectPath $Env:UNITY_ROOT_FOLDER -batchmode -nographics -master -arm64 -buildOutput App -customBuildPath App -buildTarget WSAPlayer -buildVersion $Env:BUILD_VERSION -customBuildName $Env:BUILD_NAME -logfile $unityBuildLogFile -executeMethod UnityBuilderAction.Builder.BuildProject -wsaArchitecture ARM64 -wsaUWPBuildType D3D -wsaMinUWPSDK 10.0.18362.0 -wsaSubtarget HoloLens"
+          $proc = Start-Process -FilePath $editor -ArgumentList $argumentList -PassThru;
+          $ljob = Start-Job -ScriptBlock { param($log) Get-Content "$log" -Wait } -ArgumentList $unityBuildLogFile;
+          Start-Sleep -Seconds $startupTime
+          $noProgressCounter = 0;
+          do
+          {
+            $oldlength = $(Get-Item $unityBuildLogFile).length;
+            Receive-Job $ljob;
+            Start-Sleep -Seconds 10;
+            $length=$(Get-Item $unityBuildLogFile).length;
+            if($length -eq $oldlength)
+            {
+              $noProgressCounter++;
+              echo ">>>>>> no progress counter = $noProgressCounter";
+            }
+            else
+            {
+              $noProgressCounter = 0;
+            }
+          } until($noProgressCounter -eq ($timeout/10));
+          Receive-Job $ljob;
+          Stop-Job $ljob;
+          Remove-Job $ljob;
+          Stop-Process $proc;
+          
+      - name: Update version number
+        run : |
+          $manifestfile = $Env:UNITY_ROOT_FOLDER + "/App/" + $Env:PACKAGE_NAME + "/Package.appxmanifest"
+          echo $manifestfile;
+          [xml]$manifest = get-content $manifestfile;
+          $versionparts = $manifest.Package.Identity.Version.Split('.');
+          $appBuildVersion = [int]$Env:GITHUB_RUN_NUMBER - [int]$Env:VERSION_OFFSET
+          $versionparts[2] = [int]$versionparts[2] + [int]$appBuildVersion;
+          $versionstring = $versionstring = $versionparts -join '.';
+          $manifest.Package.Identity.Version = $versionstring;
+          $manifest.save($manifestfile);
+          $uploadpath = ([string]$Env:GITHUB_RUN_NUMBER).PadLeft(10,'0') + "_" + $versionstring; 
+          echo "UPLOADPATH=$uploadpath" | Out-File -FilePath $Env:GITHUB_ENV -Encoding utf8 -Append;
+
+      - name: Add MSBuild to the PATH
+        uses: microsoft/setup-msbuild@v1.1
+
+      # First, build the test MSIX. Code signing is ENABLED. It now uses the identity from WSATestCertificate.pfx
+
+      - name: Run MSBuild to make MSIX
+        run : |
+          $solution = $Env:UNITY_ROOT_FOLDER + "/App/" +  $Env:PACKAGE_NAME + ".sln";
+          $certData = Get-PfxCertificate -FilePath Assets/WSATestCertificate.pfx
+          $thumbprint = $certData.Thumbprint
+          msbuild $solution -t:restore,Il2CppOutputProject,$Env:PACKAGE_NAME /p:configuration=Master /p:Platform=Arm64 /p:UapAppxPackageBuildMode=SideloadOnly /p:PackageCertificateThumbprint=$thumbprint /p:AppxPackageSigningEnabled=true 
+
+      - name: Kill mspdbsrv.exe
+        run : taskkill /f /t /im mspdbsrv.exe
+        continue-on-error: true
+
+      - name: Find MSIX
+        run : |
+            $artifactfolder = $Env:UNITY_ROOT_FOLDER +  "/App/AppPackages";
+            $artifact = Get-Childitem -Path $artifactfolder *.msix -Recurse -ErrorAction SilentlyContinue;
+            $filename=$artifact.fullname;
+            echo "MSIX=$filename" | Out-File -FilePath $Env:GITHUB_ENV -Encoding utf8 -Append;
+
+      - uses: LanceMcCarthy/Action-AzureBlobUpload@v2.1.0
+        name: Upload MSIX to Azure
+        with:
+          connection_string: ${{ secrets.UPLOADBLOB }}
+          container_name: ${{ env.UPLOAD_CONTAINER_NAME }}
+          source_folder: ${{ env.MSIX }}
+          destination_folder: ${{ env.UPLOADPATH }} 
+
+      - name: Clean build artifacts folder
+        run: |
+          Remove-Item -path ($Env:UNITY_ROOT_FOLDER + "/App/AppPackages") -recurse -force;
+          Remove-Item -path ($Env:UNITY_ROOT_FOLDER + "/App/build/bin") -recurse -force;
+          Remove-Item -path ($Env:UNITY_ROOT_FOLDER + "/App/build/obj") -recurse -force;
+
+      # # Then, build the Store MSIXUPLOAD. Code signing is DISABLED
+
+      - name: Run MSBuild to make MSIXUPLOAD
+        run : |
+           $solution = $Env:UNITY_ROOT_FOLDER + "/App/" +  $Env:PACKAGE_NAME + ".sln";
+           msbuild $solution -t:restore,Il2CppOutputProject,$Env:PACKAGE_NAME /p:configuration=Master /p:Platform=Arm64 /p:UapAppxPackageBuildMode=storeupload /p:AppxPackageSigningEnabled=false /p:GenerateAppInstallerFile=false 
+
+      - name: Kill mspdbsrv.exe
+        run : taskkill /f /t /im mspdbsrv.exe
+        continue-on-error: true
+
+      - name: Find MSIXUPLOAD
+        run : |
+            $artifactfolder = ($Env:UNITY_ROOT_FOLDER + "/App/AppPackages");
+            $artifact = Get-Childitem -Path $artifactfolder *.msixupload -Recurse -ErrorAction SilentlyContinue;
+            $filename=$artifact.fullname;
+            echo "MSIXUPLOAD=$filename" | Out-File -FilePath $Env:GITHUB_ENV -Encoding utf8 -Append;
+
+      - uses: LanceMcCarthy/Action-AzureBlobUpload@v2.1.0
+        name: Upload MSIXUPLOAD to Azure
+        with:
+          connection_string: ${{ secrets.UPLOADBLOB }}
+          container_name: ${{ env.UPLOAD_CONTAINER_NAME }}
+          source_folder: ${{ env.MSIXUPLOAD }}
+          destination_folder: ${{ env.UPLOADPATH }}
