@@ -10,6 +10,9 @@ using UnityEditor;
 using UnityEditor.Build.Reporting;
 using UnityEngine;
 
+// Nicked from here https://github.com/game-ci/unity-builder/tree/main
+// and adapted to accept HoloLens specific parameters
+
 namespace UnityBuilderAction
 {
   static class Builder
